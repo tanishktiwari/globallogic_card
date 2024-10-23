@@ -2,57 +2,71 @@ const express = require("express");
 const router = express.Router();
 const SeatList = require("../models/SeatList");
 
-// Helper function to generate multiple continuous sequences
-const generateContinuousSequences = (idNumbers, totalCards, numSequences = 5) => {
+// Helper function to generate continuous sequences of available IDs
+const generateContinuousSequences = (idNumbers, totalCards) => {
   const sortedIds = [...new Set(idNumbers)].sort((a, b) => a - b);
   const sequences = [];
+  
   let currentSequence = [];
+  let lastId = -1;
 
-  sortedIds.forEach((id, index) => {
-    if (index === 0 || id === sortedIds[index - 1] + 1) {
+  // Generate sequences based on available IDs
+  for (const id of sortedIds) {
+    if (id === lastId + 1) {
       currentSequence.push(id);
     } else {
       if (currentSequence.length > 0) {
         sequences.push(currentSequence);
       }
-      currentSequence = [id];
+      currentSequence = [id]; // Start a new sequence
     }
-  });
+    lastId = id;
+  }
 
   if (currentSequence.length > 0) {
     sequences.push(currentSequence);
   }
 
-  const resultSequences = [];
+  const resultRanges = [];
+  let lastEnd = -1; // Track the end of the last range added
 
+  // Collect up to five distinct ranges of the specified length
   for (const seq of sequences) {
-    if (seq.length >= totalCards) {
-      resultSequences.push(seq.slice(0, totalCards));
-      if (resultSequences.length >= numSequences) {
-        break;
+    for (let i = 0; i <= seq.length - totalCards; i++) {
+      const rangeStart = seq[i];
+      const rangeEnd = seq[i + totalCards - 1];
+
+      // Ensure ranges don't overlap and start after the previous range
+      if (lastEnd === -1 || rangeStart > lastEnd) {
+        resultRanges.push(seq.slice(i, i + totalCards));
+        lastEnd = rangeEnd; // Update lastEnd to the current range's end
       }
+
+      if (resultRanges.length === 5) break; // Limit to 5 distinct ranges
     }
+    if (resultRanges.length === 5) break; // Stop if we've collected 5 ranges
   }
 
-  return resultSequences;
+  // Prepare the range messages
+  const rangeMessages = resultRanges.map(range => `Available ID Card No.- ${range[0]} to ${range[range.length - 1]}`);
+  return rangeMessages;
 };
+
 
 router.post("/get-cards", async (req, res) => {
   const { location, totalCards } = req.body;
 
-  if (totalCards === undefined || totalCards <= 0) {
+  if (!location || !location.city || totalCards <= 0) {
     return res.status(400).json({
       success: false,
-      message: "Please enter a valid number of cards",
+      message: "Please provide a valid city and number of cards",
     });
   }
 
-  const locations = Array.isArray(location) 
-    ? location.map((loc) => loc.city.toLowerCase()) 
-    : [location.toLowerCase()];
+  const city = location.city.toLowerCase();
 
   try {
-    const sampleData = await SeatList.find({ city: { $in: locations } }).exec();
+    const sampleData = await SeatList.find().exec();
 
     if (sampleData.length === 0) {
       return res.status(404).json({
@@ -61,27 +75,41 @@ router.post("/get-cards", async (req, res) => {
       });
     }
 
-    const results = await Promise.all(sampleData.map(async (locationData) => {
+    const bookedIds = new Set();
+    const availableIdsMap = new Map();
+
+    // Collect available id_nos and booked ids
+    for (const locationData of sampleData) {
       const details = locationData.details || [];
-      const filteredDetails = details.filter(detail => detail.booked === "" && parseInt(detail.id_no, 10) !== 0);
-      const idNumbers = filteredDetails.map(detail => parseInt(detail.id_no, 10));
-      const continuousSequences = generateContinuousSequences(idNumbers, totalCards);
+      details.forEach(detail => {
+        const idNo = parseInt(detail.id_no, 10);
+        if (detail.booked === "true") {
+          bookedIds.add(idNo);
+        } else if (detail.booked === "") {
+          availableIdsMap.set(idNo, (availableIdsMap.get(idNo) || 0) + 1);
+        }
+      });
+    }
 
-      const finalFilteredDetails = continuousSequences.map(sequence => 
-        filteredDetails.filter(detail =>
-          sequence.includes(parseInt(detail.id_no, 10))
-        )
-      );
+    const uniqueAvailableIds = [...availableIdsMap.keys()].filter(idNo => !bookedIds.has(idNo));
 
-      return {
-        city: locationData.city,
-        details: finalFilteredDetails, // Send nested arrays of objects
-      };
-    }));
+    const continuousRanges = generateContinuousSequences(uniqueAvailableIds, totalCards);
+
+    if (continuousRanges.length === 0) {
+      return res.status(404).json({
+        success: false,
+        message: "No continuous sequences of available IDs found",
+      });
+    }
 
     return res.status(200).json({
       success: true,
-      data: results,
+      data: {
+        city: city,
+        details: {
+          available_ranges: continuousRanges,
+        },
+      },
       message: "Data fetched successfully",
     });
 
@@ -108,7 +136,6 @@ router.post("/book-cards", async (req, res) => {
     });
 
     const results = await Promise.all(updatePromises);
-
     const totalModified = results.reduce((acc, result) => acc + result.nModified, 0);
 
     if (totalModified === 0) {
